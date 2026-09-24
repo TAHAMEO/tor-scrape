@@ -1,0 +1,81 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tor-scrape"
+version = "0.1.0"
+description = "Research-only Tor crawler for discovering publicly linked v3 onion services and mapping their link graph."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+authors = [{ name = "tor-scrape contributors" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
+    "Topic :: Security",
+]
+dependencies = [
+    "aiohttp>=3.9",
+    "aiohttp-socks>=0.9",       # SOCKS5 with remote DNS (rdns) for Tor
+    "aiosqlite>=0.20",
+    "defusedxml>=0.7",          # XXE / entity-expansion safe sitemap parsing
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "PyYAML>=6.0",
+    "selectolax>=0.3.21",       # Lexbor HTML5 parser
+    "stem>=1.8",                # Tor control port
+    "structlog>=24.1",
+    "typer>=0.12",
+]
+
+[project.optional-dependencies]
+render = ["playwright>=1.44"]
+postgres = ["asyncpg>=0.29"]
+neo4j = ["neo4j>=5.20"]
+bloom = ["rbloom>=1.5"]
+dev = [
+    "mypy>=1.10",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+    "types-PyYAML",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/torscrape"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-ra --strict-markers"
+markers = [
+    "integration: exercises the real SOCKS code path against in-process mock servers",
+    "tor: needs a live Tor client; runs only when TORSCRAPE_LIVE=1",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "S", "RUF", "ASYNC", "PT"]
+ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+    "S101",  # assert is how pytest works
+    "S311",  # seeded PRNGs generate reproducible test inputs
+]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+plugins = ["pydantic.mypy"]
+mypy_path = "src"

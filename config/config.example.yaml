@@ -1,0 +1,95 @@
+# tor-scrape configuration. Copy to config/config.yaml and adjust.
+#
+# Every value below is the built-in default, so this file loads to exactly the
+# same settings as no file at all (tests/unit/test_config.py checks that).
+#
+# Precedence: TORSCRAPE_* environment variables > this file > defaults.
+# Nested keys use "__", e.g. TORSCRAPE_TOR__SOCKS_HOST=tor.
+# Relative paths are resolved from the working directory.
+
+tor:
+  socks_host: 127.0.0.1         # "tor" inside docker-compose
+  socks_port: 9050
+  control_host: 127.0.0.1
+  control_port: 9051
+  # Set one of these through the environment, not in this file:
+  #   TORSCRAPE_TOR__CONTROL_PASSWORD=...
+  #   TORSCRAPE_TOR__CONTROL_COOKIE_PATH=/var/lib/tor/control_auth_cookie
+  stream_isolation: true        # separate circuits per onion service
+  newnym_after_failures: 20     # consecutive circuit failures before NEWNYM (min 5)
+  newnym_min_interval_s: 60     # min 10 (Tor's own limit)
+
+http:
+  # Identify the crawler honestly so operators can opt out through robots.txt.
+  # Consider adding a contact, e.g. "tor-scrape-research/0.1 (+mailto:you@example.org)".
+  user_agent: tor-scrape-research/0.1
+  connect_timeout_s: 45         # rendezvous setup is slow
+  total_timeout_s: 90
+  max_body_bytes: 2097152       # 2 MiB after decompression (16 KiB..16 MiB)
+  max_redirects: 5
+  # Text only. Images, media and binaries cannot be enabled.
+  allowed_content_types:
+    - text/html
+    - application/xhtml+xml
+    - text/plain
+    - application/xml
+    - text/xml
+
+retry:
+  max_attempts: 3
+  backoff_base_s: 30            # exponential backoff with full jitter
+  backoff_max_s: 3600
+  retry_after_cap_s: 3600       # longest Retry-After we will honour
+  offline_recheck_h: [1.0, 6.0, 24.0]   # descriptor-not-found rechecks
+
+crawl:
+  seeds_file: config/seeds.txt
+  global_concurrency: 8         # max 32
+  per_host_concurrency: 1       # max 2
+  per_host_delay_s: 10          # min 2; +/- delay_jitter, doubled on 429/503
+  delay_jitter: 0.3
+  max_host_delay_s: 600
+  max_depth: 3                  # within one service
+  max_pages_per_service: 50
+  max_total_pages: 100000
+  hub_hints: [links, directory, list, wiki, mirror, onion, sites, catalog, hub]
+
+robots:
+  # robots.txt is always honoured. This is the token matched against
+  # "User-agent:" lines.
+  agent_token: tor-scrape
+  cache_ttl_h: 24
+
+render:
+  # Playwright fallback. Off by default; when enabled it runs only for the
+  # services listed here, and only when static parsing finds no links.
+  enabled: false
+  allowed_services: []
+  timeout_s: 60
+  max_concurrency: 1
+
+discovery:
+  # Local lists of already-indexed onions (one address per line). Services
+  # missing from all of them are flagged as not in a known index.
+  known_index_files: []
+  follow_onion_location: true
+  record_invalid_mentions: true # checksum-invalid mentions are stored, never fetched
+
+safety:
+  # denylist_file: config/denylist.txt                   # never fetched
+  # quarantine_terms_file: config/quarantine_terms.txt   # stop + flag on match
+  denylist_file: null
+  quarantine_terms_file: null
+
+storage:
+  backend: sqlite
+  sqlite_path: data/torscrape.db
+
+retention:
+  raw_metadata_days: 90         # page-level rows; service-level graph kept until purged
+  log_days: 90
+
+logging:
+  level: INFO
+  format: json                  # or "console"
+  file: null                    # e.g. logs/torscrape.log (rotated daily)
