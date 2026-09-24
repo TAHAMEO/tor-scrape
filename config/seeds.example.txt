@@ -1,0 +1,8 @@
+# Seed list: one onion URL or bare v3 address per line. Copy to config/seeds.txt.
+#
+# Lines starting with "#" and blank lines are ignored. Addresses are
+# checksum-validated when loaded; invalid ones are reported and skipped.
+# Only .onion targets are accepted in this phase.
+
+# The Tor Project (links to its other onion services)
+http://2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion/

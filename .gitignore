@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local configuration and data: seed lists, denylists and crawl results can be
+# sensitive. Keep them out of version control.
+config/config.yaml
+config/seeds.txt
+config/denylist.txt
+config/quarantine_terms.txt
+config/known_index/
+data/
+exports/
+logs/
+*.db
+*.db-wal
+*.db-shm

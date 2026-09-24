@@ -1,7 +1,8 @@
-# tor-scrape: architecture (draft v0.1)
+# tor-scrape: architecture (v0.2)
 
-> **Status:** proposal. It waits on answers to the open questions in §13.
-> Defaults marked ⚙ are what gets built if nothing changes.
+> **Status:** accepted. The scope decisions are recorded in §13, retention in
+> §14 and the phase-2 extension points in §15. ⚙ marks a default that can be
+> changed in `config/config.example.yaml`.
 
 tor-scrape is a research-only crawler. It reaches publicly accessible v3 `.onion`
 sites through Tor, pulls out every link and onion address those sites mention, and
@@ -15,8 +16,11 @@ stores the resulting service-level link graph for analysis.
 
 - Discover v3 onion services that are linked or mentioned somewhere reachable
   **without authentication**, and map which services link to which.
-- Record lightweight metadata (liveness, title, language, content hashes) and export
-  it to SQLite/PostgreSQL, Neo4j, JSONL, CSV and GraphML.
+- Record metadata only: onion address, discovery source (channel and referring
+  service), first and last seen, checksum validity, reachability status and
+  index presence, plus content hashes for mirror detection. Export it to
+  JSONL, CSV and GraphML. PostgreSQL and Neo4j are optional add-ons.
+- Never store page HTML, text, titles, images or binaries.
 - Put a light load on the Tor network and on the sites being crawled.
 
 **Non-goals.** The code enforces these; they are more than documentation.
@@ -115,7 +119,7 @@ The crawler container reaches the internet only through the Tor container.
 | Module | Responsibility | Key decisions |
 |---|---|---|
 | `config.py` | Loads settings from YAML, overridable by `TORSCRAPE_*` environment variables | `pydantic-settings`, validated on startup; a config hash is recorded with each run |
-| `logging.py` | Structured JSON logs | `structlog`. Logs never contain bodies or cookies, query strings are redacted and titles are truncated. |
+| `logging.py` | Structured JSON logs | `structlog`. Logs never contain bodies, titles or cookies, and query strings are redacted. Optional file output rotates daily and keeps `retention.log_days` files. |
 | `onion.py` | v3 validation (length, alphabet, checksum, version) plus extraction regexes, including defanged forms | Pure functions, fully unit-tested |
 | `urlnorm.py` | Canonical URLs, service key, scope checks | Lowercases scheme and host, drops default ports and fragments, resolves dot segments, sorts the query, strips tracking parameters. `www.<addr>.onion` maps to the same service key. |
 | `tor/session.py` | The one factory for HTTP sessions | `aiohttp` with `aiohttp-socks` and `rdns=True`, so DNS resolves remotely and nothing leaks. **Fails closed:** it refuses to build a session without the proxy and never falls back to a direct connection. Each service gets its own SOCKS username, which isolates streams the way Tor Browser's first-party isolation does. |
@@ -124,7 +128,7 @@ The crawler container reaches the internet only through the Tor container.
 | `fetch/fetcher.py` | Streams the GET and enforces caps | Checks the content-type allowlist before reading the body. Caps decompressed bytes (gzip-bomb safe). Allows up to 5 redirects, each re-checked against scope. Uses an ephemeral per-host cookie jar that is never persisted. |
 | `fetch/retry.py` | Backoff and adaptive per-host delay | Exponential backoff with full jitter. Honors `Retry-After` (capped). AIMD: the host delay doubles on 429/503 and shrinks 10% on success, down to a floor. |
 | `fetch/robots.py` | robots.txt cache and sitemap discovery | Follows RFC 9309: a 4xx means allow, a 5xx or network error means disallow for now and retry later. Disallowed paths are **recorded but never enqueued**. |
-| `fetch/renderer.py` | JavaScript-rendering fallback | Playwright Chromium through Tor. Used only when heuristics flag a page as JS-built (few links, heavy script, `<noscript>` hints). Blocks image, media, font, stylesheet and websocket requests. WebRTC is disabled, the profile is ephemeral, downloads are off and the sandbox stays on. |
+| `fetch/renderer.py` | JavaScript-rendering fallback | Playwright Chromium through Tor. Used only for services on `render.allowed_services`, and only when heuristics flag a page as JS-built (few links, heavy script, `<noscript>` hints). Blocks image, media, font, stylesheet and websocket requests. WebRTC is disabled, the profile is ephemeral, downloads are off and the sandbox stays on. |
 | `extract/html.py` | Pulls links out of HTML | `selectolax` (Lexbor, HTML5-compliant, roughly 10–30× faster than BeautifulSoup) |
 | `extract/scripts.py` | URLs and onion addresses in inline and external JS string literals | Regex over string tokens; JS is never executed here |
 | `extract/text.py` | Plain-text and defanged onion mentions in visible text and comments | Every candidate is checksum-validated |
@@ -144,22 +148,43 @@ The crawler container reaches the internet only through the Tor container.
 
 **Relational (SQLite ⚙ / PostgreSQL)**
 
+The tables fall into two retention classes (§14): **aggregate** tables are kept
+until you purge them, and **raw** tables are purged after
+`retention.raw_metadata_days` (90 by default).
+
 ```sql
+-- AGGREGATE: one row per onion label ever seen, valid or not.
 services (
-  onion            TEXT PRIMARY KEY,      -- 56-char v3 label, no ".onion"
-  status           TEXT NOT NULL,         -- unknown|online|offline|gated|restricted|
-                                          -- quarantined|denylisted|invalid
-  title            TEXT,                  -- truncated (200 chars)
-  lang             TEXT,                  -- from <html lang>
-  first_seen       TIMESTAMP NOT NULL,
-  last_seen        TIMESTAMP,             -- last successful fetch
-  last_checked     TIMESTAMP,
-  pages_crawled    INTEGER DEFAULT 0,
-  in_known_index   BOOLEAN DEFAULT FALSE,
-  discovered_via   TEXT,                  -- channel of first discovery
-  discovered_from  TEXT                   -- onion that first mentioned it
+  onion             TEXT PRIMARY KEY,     -- 56-char label, no ".onion"
+  checksum_valid    BOOLEAN NOT NULL,     -- invalid rows are never fetched
+  status            TEXT NOT NULL,        -- unknown|online|offline|gated|restricted|
+                                          -- denied|quarantined|denylisted|invalid
+  first_seen        TIMESTAMP NOT NULL,   -- first mention anywhere
+  last_seen         TIMESTAMP,            -- last successful fetch (reachability)
+  last_checked      TIMESTAMP,            -- last fetch attempt
+  discovered_via    TEXT NOT NULL,        -- seed|known_index|href|src|action|meta_refresh|
+                                          -- data_attr|js|text|comment|sitemap|robots|
+                                          -- onion_location|header
+  discovered_from   TEXT,                 -- onion label that first mentioned it
+  in_known_index    BOOLEAN NOT NULL DEFAULT FALSE,
+  known_index_sources TEXT,               -- which imported lists contain it
+  pages_crawled     INTEGER NOT NULL DEFAULT 0,
+  next_check_at     TIMESTAMP             -- phase 2: liveness scheduling
 );
 
+-- AGGREGATE: service-level link graph (the one exported to GraphML).
+service_links (
+  src_onion    TEXT NOT NULL REFERENCES services(onion),
+  dst_onion    TEXT NOT NULL REFERENCES services(onion),
+  channels     TEXT NOT NULL,             -- set of channels seen, e.g. "href,text"
+  forms        TEXT,                      -- plain|defanged|bare, for text mentions
+  mention_count INTEGER NOT NULL DEFAULT 1,
+  first_seen   TIMESTAMP NOT NULL,
+  last_seen    TIMESTAMP NOT NULL,
+  PRIMARY KEY (src_onion, dst_onion)
+);
+
+-- RAW: one row per fetched URL. Hashes only, never content.
 pages (
   id            INTEGER PRIMARY KEY,
   url           TEXT UNIQUE NOT NULL,     -- canonical
@@ -168,54 +193,58 @@ pages (
   http_status   INTEGER,
   content_type  TEXT,
   bytes         INTEGER,
-  sha256        TEXT,                     -- exact-duplicate detection
-  simhash       INTEGER,                  -- near-duplicate / clone clustering
-  title         TEXT,
-  rendered      BOOLEAN DEFAULT FALSE,
+  sha256        TEXT,                     -- exact duplicates
+  simhash       INTEGER,                  -- near duplicates / mirror clusters (phase 2)
+  rendered      BOOLEAN NOT NULL DEFAULT FALSE,
   error_class   TEXT,
   fetched_at    TIMESTAMP
 );
 
+-- RAW: page-level edges; rolled up into service_links as they are written.
 edges (
   src_page_id  INTEGER NOT NULL REFERENCES pages(id),
-  dst_url      TEXT NOT NULL,
-  dst_onion    TEXT,                      -- NULL for clearnet targets
-  channel      TEXT NOT NULL,             -- href|src|action|meta_refresh|data_attr|js|
-                                          -- text|comment|sitemap|robots|onion_location|header
+  dst_url      TEXT NOT NULL,             -- canonical onion URL (or bare host)
+  dst_onion    TEXT NOT NULL,
+  channel      TEXT NOT NULL,
+  form         TEXT,                      -- plain|defanged|bare for text/js/comment
   first_seen   TIMESTAMP NOT NULL,
   last_seen    TIMESTAMP NOT NULL,
   PRIMARY KEY (src_page_id, dst_url, channel)
 );
 
+-- RAW: work queue and its history.
 frontier (
-  url           TEXT PRIMARY KEY,
-  onion         TEXT NOT NULL,
-  depth         INTEGER NOT NULL,
-  priority      REAL NOT NULL,            -- lower = sooner
-  state         TEXT NOT NULL,            -- pending|in_flight|done|failed|skipped
-  attempts      INTEGER DEFAULT 0,
-  not_before    TIMESTAMP,                -- backoff / Retry-After
-  discovered_from TEXT
+  url             TEXT PRIMARY KEY,
+  onion           TEXT NOT NULL,
+  task_kind       TEXT NOT NULL DEFAULT 'crawl',   -- crawl | liveness (phase 2)
+  depth           INTEGER NOT NULL,
+  priority        REAL NOT NULL,          -- lower = sooner
+  state           TEXT NOT NULL,          -- pending|in_flight|done|failed|skipped
+  attempts        INTEGER NOT NULL DEFAULT 0,
+  not_before      TIMESTAMP,              -- backoff / Retry-After / recheck
+  discovered_from TEXT,
+  updated_at      TIMESTAMP NOT NULL
 );
 
-runs (id, started_at, finished_at, config_hash, stats_json);
-known_index (onion TEXT PRIMARY KEY, source TEXT, imported_at TIMESTAMP);
+-- RAW: status transitions, the feed for phase-2 alerts.
+service_events (onion, at, old_status, new_status, error_class);
+
+runs (id, started_at, finished_at, config_fingerprint, stats_json);
+known_index (onion TEXT, source TEXT, imported_at TIMESTAMP, PRIMARY KEY (onion, source));
 ```
 
-The pages table stores no raw HTML and no body text by default (see §8).
+The crawler never writes titles, text, HTML or anchor text. Titles and anchor
+text exist only in memory, long enough for the quarantine check (§8).
 
-**Graph (Neo4j, optional)**
+**Graph (Neo4j, optional, later)**
 
 ```
-(:Service {onion, status, title, first_seen, last_seen, in_known_index})
-(:Service)-[:LINKS_TO {count, channels, first_seen, last_seen}]->(:Service)
--- optional page level:
-(:Page {url, http_status, fetched_at})-[:ON]->(:Service)
-(:Page)-[:LINKS_TO {channel}]->(:Page)
+(:Service {onion, status, checksum_valid, first_seen, last_seen, in_known_index})
+(:Service)-[:LINKS_TO {mention_count, channels, first_seen, last_seen}]->(:Service)
 ```
 
-The graph that matters for analysis is service to service. The page-level graph
-gets large quickly and is off by default.
+This graph comes straight from `services` and `service_links`, so it can be
+rebuilt at any time.
 
 ## 6. Error classification and retry policy
 
@@ -238,28 +267,29 @@ gets large quickly and is off by default.
 `ExtendedErrors` has to be set on the `SocksPort` in `torrc`, or Tor will not send
 the `0xF*` codes.
 
-## 7. Politeness defaults ⚙
+## 7. Politeness defaults
 
-```yaml
-crawl:
-  global_concurrency: 8          # onion circuits are expensive for relays; keep modest
-  per_host_concurrency: 1
-  per_host_delay_s: 10           # ±30% jitter; AIMD-adjusted
-  max_depth: 3                   # within one service
-  max_pages_per_service: 50      # breadth over depth: discovery is the goal
-  max_total_pages: 100000
-  recrawl_after_h: 168           # phase 2
-http:
-  connect_timeout_s: 45          # rendezvous setup is slow
-  total_timeout_s: 90
-  max_body_bytes: 2097152        # 2 MiB decompressed
-  max_redirects: 5
-  user_agent: "tor-scrape-research/0.1 (+contact: <you>)"
-  allow_clearnet: false
-robots:
-  respect: true
-  cache_ttl_h: 24
-```
+The full, commented list is in
+[`config/config.example.yaml`](../config/config.example.yaml). A test keeps that
+file identical to the built-in defaults. The main values:
+
+| Setting | Default | Hard bound |
+|---|---|---|
+| `crawl.global_concurrency` | 8 | 1–32 |
+| `crawl.per_host_concurrency` | 1 | 1–2 |
+| `crawl.per_host_delay_s` | 10 s ± 30% jitter; doubles on 429/503 | ≥ 2 s |
+| `crawl.max_depth` (within a service) | 3 | 0–10 |
+| `crawl.max_pages_per_service` | 50 | — |
+| `crawl.max_total_pages` | 100,000 | — |
+| `http.connect_timeout_s` / `total_timeout_s` | 45 / 90 s | ≤ 300 / 600 s |
+| `http.max_body_bytes` (decompressed) | 2 MiB | 16 KiB–16 MiB |
+| `http.max_redirects` (onion to onion only) | 5 | ≤ 10 |
+| `http.allowed_content_types` | html, xhtml, plain, xml | textual types only |
+| `tor.newnym_min_interval_s` | 60 s | ≥ 10 s |
+
+Some behaviour has no switch at all. robots.txt is always respected, the scope
+is always onion-only, and binary content types are rejected by the config
+validator.
 
 **User-agent tradeoff.** ⚙ The default is an honest user-agent that identifies the
 crawler. Operators can then opt out through robots.txt, which is standard research
@@ -279,15 +309,16 @@ any of it.
 - **Text only.** The allowlist covers `text/html`, `application/xhtml+xml`,
   `text/plain`, `application/xml` and `text/xml`. Any other type is aborted before
   its body is read. The renderer drops `image`, `media` and `font` requests.
-- **Metadata only by default.** Stored fields are the title (truncated), language,
-  hashes, simhash, links and status. Raw HTML and body text are **not** stored.
-  Storing text snippets can be turned on, with a retention TTL, if you decide you
-  need it (question 4).
+- **Metadata only.** Stored fields are addresses, discovery source, timestamps,
+  checksum validity, status, HTTP status, byte counts, content hashes and links.
+  HTML, body text, titles and anchor text are **never** stored, and there is no
+  option to store them.
 - **Denylist.** You maintain a list of onion addresses. Denylisted services are
   never fetched. Edges pointing at them are still recorded, so the graph stays
   truthful.
 - **Keyword quarantine.** A configurable list of indicator terms is matched
-  against URLs, titles and anchor text. On a match, crawling of that service stops
+  against URLs, plus titles and anchor text while they are still in memory. On a
+  match, crawling of that service stops
   at once, nothing from it is stored beyond the address and a `quarantined` status,
   and the event is logged for human review. The tool ships the **mechanism** with
   an empty list. Get indicator lists through appropriate channels.
@@ -300,9 +331,9 @@ any of it.
 | Risk | Mitigation |
 |---|---|
 | IP or DNS leak | A single session factory, `socks5h` (remote DNS), fail-closed, no direct-connect code path. The crawler container sits on an `internal` network with Tor as its only egress. |
-| Leaving the intended scope | Only `.onion` is allowed by default. Every redirect is re-checked. Clearnet links are recorded as edges and never fetched. |
+| Leaving the intended scope | Scope is onion-only, with no switch to change it. Every redirect is re-checked. Clearnet links are ignored. |
 | Malicious content aimed at parsers | `selectolax` does no I/O or script execution. `defusedxml` handles XML. Decompressed bytes, redirects and sitemap depth are capped. |
-| Browser exploits (renderer) | Off by default. Runs in its own process or container with an ephemeral profile, WebRTC off, downloads off, service workers blocked and the Chromium sandbox **kept on**. Blocked resource types shrink the attack surface. |
+| Browser exploits (renderer) | Off by default, and limited to an explicit per-service allowlist when enabled. Runs in its own process or container with an ephemeral profile, WebRTC off, downloads off, service workers blocked and the Chromium sandbox **kept on**. Blocked resource types shrink the attack surface. |
 | Container breakout or pivot | Non-root UID, read-only root filesystem, `cap_drop: [ALL]`, `no-new-privileges`, tmpfs `/tmp`, a single data volume, Tor ports never published to the host, control port protected by cookie or hashed-password auth. |
 | Sensitive data at rest | The DB holds addresses of sites that may be criminal. Use an encrypted volume and restrict access. Logs carry no bodies, and their query strings are redacted. |
 | Exposing an open SOCKS proxy | The Tor container binds SOCKS only on the internal Docker network and never on `0.0.0.0` of the host. |
@@ -374,38 +405,59 @@ when `TORSCRAPE_LIVE=1`.
 
 ## 12. Build order
 
-1. `pyproject.toml`, `config.py`, `logging.py`, `models.py`
-2. `onion.py`, `urlnorm.py` and their unit tests
-3. `tor/errors.py`, `tor/session.py`, `tor/controller.py`
-4. `fetch/retry.py`, `fetch/robots.py`, `fetch/fetcher.py`
-5. `extract/*` with fixture tests
-6. `frontier/*` (scheduler, dedupe)
-7. `storage/sqlite.py` and `schema.sql`
-8. `crawler.py` and `cli.py`
-9. Integration tests (fake SOCKS5 and mock onion site)
-10. Exporters
-11. Dockerfiles and `docker-compose.yml`
-12. Optional extras: renderer, Postgres, Neo4j, Redis
-13. Docs: ETHICS, ROADMAP, TROUBLESHOOTING, examples
+1. ✅ `pyproject.toml`, `config.py`, example config and seeds
+2. ✅ `onion.py` with unit tests (checksum, host parsing, plain, defanged and bare extraction)
+3. `logging.py`, `models.py`, `urlnorm.py` and their unit tests
+4. `tor/errors.py`, `tor/session.py`, `tor/controller.py`
+5. `fetch/retry.py`, `fetch/robots.py`, `fetch/fetcher.py`
+6. `extract/*` with fixture tests
+7. `frontier/*` (scheduler, dedupe)
+8. `storage/sqlite.py` and `schema.sql`, including retention purge
+9. `crawler.py` and `cli.py`
+10. Integration tests (fake SOCKS5 and mock onion site)
+11. Exporters (JSONL, CSV, GraphML)
+12. Dockerfiles and `docker-compose.yml`
+13. Playwright fallback, restricted to the render allowlist
+14. Docs: ETHICS, ROADMAP, TROUBLESHOOTING, example commands and output
+15. Later, optional: PostgreSQL, Neo4j, Redis
 
-## 13. Open questions
+## 13. Decisions
 
-1. **Purpose and output.** Is this threat intelligence, academic measurement,
-   brand or phishing-clone monitoring, or something else? The answer decides which
-   metadata is worth keeping.
-2. **Scale.** How many services or pages are you aiming for? One machine, or
-   several workers?
-3. **Storage and graph.** Is Neo4j required for the MVP, or are SQLite and a
-   GraphML export (for Gephi) enough to start? Do you already run PostgreSQL?
-4. **Content retention and jurisdiction.** Metadata only ⚙, or text snippets for
-   keyword search? What retention period? Which jurisdiction, and has legal or an
-   ethics board reviewed the work?
-5. **Scope and seeds.** Onion only ⚙, or also clearnet seed sources fetched
-   through Tor (public directories, code repositories, paste sites)? Do you have a
-   seed list?
-6. **JavaScript rendering.** Is it really needed, or can it be an off-by-default
-   fallback ⚙?
-7. **Deployment.** Docker on a laptop, a VM or a VPS? An existing Tor daemon, or
-   the bundled container ⚙? Any hosting provider rules about Tor?
-8. **Mode.** One-off discovery, or continuous monitoring (liveness checks, new
-   mirror detection, alerts)?
+| Topic | Decision |
+|---|---|
+| Purpose | Authorized OSINT research: discover publicly reachable onion addresses that surface search engines don't show, and map how they link to one another. |
+| Metadata | Address, discovery source, first and last seen, checksum validity, reachability, index presence. No page content. |
+| Scale | One machine, about 100k pages, one Tor client (1–3 pages/s). Wide rather than deep: at most 50 pages and 3 levels per site. |
+| Storage | SQLite as the main store, GraphML for analysis. PostgreSQL and Neo4j are optional and not needed for the MVP. |
+| Content | Metadata only. No HTML, text snippets, titles, images or binaries. "Report, don't collect" for illegal content. |
+| Jurisdiction | Jurisdiction-agnostic design. The operator handles legal compliance and ethics review. |
+| Scope | Onion only. Seeds come from the seed file; Onion-Location headers and local index lists add more. No clearnet crawling in this phase. |
+| JS rendering | Off by default. When enabled, it runs only for services on `render.allowed_services`, and only after static parsing finds no links. |
+| Deployment | Docker Compose with a bundled Tor container. Non-root, read-only filesystem, all capabilities dropped, Tor ports internal only. |
+| Mode | One-off discovery for the MVP. The data model and queue are ready for phase-2 monitoring (§15). |
+
+## 14. Retention
+
+| Data | Kept for | How it is enforced |
+|---|---|---|
+| `pages`, `edges`, finished `frontier` rows, `service_events`, `runs` | `retention.raw_metadata_days` (90) | A `purge` CLI command, which also runs at the start of each crawl, deletes rows older than the cutoff |
+| Log files | `retention.log_days` (90) | Daily rotation that keeps N files. When logging to stdout under Docker, set a `max-file`/`max-size` log driver limit. |
+| `services`, `service_links`, `known_index` | Until you purge them manually | `purge --aggregates` (asks for confirmation) |
+
+Because the aggregate tables are updated incrementally as edges are written,
+purging raw rows never changes the service-level graph.
+
+## 15. Phase-2 extension points
+
+These are already in the MVP design, so monitoring can be added without
+restructuring:
+
+- **Liveness checks.** `frontier.task_kind = 'liveness'` shares the scheduler,
+  politeness rules and error classifier with crawl tasks.
+  `services.next_check_at` drives how often each service is checked.
+- **Mirror detection.** `pages.sha256` and `pages.simhash` are stored from day
+  one. Clustering services by homepage simhash is a query, not a schema change.
+- **Alerts.** Every status change is written to `service_events`. An alerting
+  job reads that table; the crawler does not need to change.
+- **Scale-out.** `Frontier` and `Repository` are protocols. Redis and PostgreSQL
+  backends slot in behind them.
