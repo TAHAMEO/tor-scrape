@@ -34,3 +34,10 @@ pip install -e ".[dev]"
 pytest
 ruff check . && mypy src
 ```
+
+Keep the quotes around `".[dev]"`. In zsh (Kali's default shell), an unquoted
+`.[dev]` fails with `no matches found`.
+
+If `pytest` reports `ModuleNotFoundError` for `pydantic`, `yaml` or another
+library, the dependencies aren't installed in the active virtualenv. Activate
+it and run `pip install -e ".[dev]"` again.

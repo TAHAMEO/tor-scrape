@@ -52,6 +52,8 @@ packages = ["src/torscrape"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Lets `pytest` run from a fresh checkout without `pip install -e .` first.
+pythonpath = ["src"]
 asyncio_mode = "auto"
 addopts = "-ra --strict-markers"
 markers = [
